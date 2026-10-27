@@ -17,6 +17,17 @@ class ExpenseApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.client = expense_app.app.test_client()
+        setup_page = cls.client.get("/setup")
+        with cls.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        response = cls.client.post("/setup", data={
+            "email": "tester@example.com",
+            "password": "Test-password-123",
+            "confirm_password": "Test-password-123",
+            "csrf_token": csrf_token,
+        })
+        if setup_page.status_code != 200 or response.status_code != 302:
+            raise RuntimeError("Could not initialize the test account.")
 
     @classmethod
     def tearDownClass(cls):
@@ -27,6 +38,18 @@ class ExpenseApiTests(unittest.TestCase):
             os.environ["EXPENSES_DATABASE"] = _previous_database
 
     def setUp(self):
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+        self.client.get("/login")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        login_response = self.client.post("/login", data={
+            "email": "tester@example.com",
+            "password": "Test-password-123",
+            "csrf_token": csrf_token,
+        })
+        self.assertEqual(login_response.status_code, 302)
+
         with expense_app.connect_db() as conn:
             conn.execute("DELETE FROM expenses")
             conn.execute("DELETE FROM budgets")
@@ -141,6 +164,140 @@ class ExpenseApiTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 200)
 
+    def test_website_requires_login_and_rejects_bad_credentials(self):
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+
+        self.assertEqual(self.client.get("/api/v1").status_code, 401)
+        protected = self.client.get("/categories")
+        self.assertEqual(protected.status_code, 302)
+        self.assertIn("/login", protected.headers["Location"])
+        self.assertIn("next=/categories", protected.headers["Location"])
+
+        self.client.get("/login")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        failed_login = self.client.post("/login", data={
+            "email": "tester@example.com",
+            "password": "wrong-password",
+            "csrf_token": csrf_token,
+        }, follow_redirects=True)
+        self.assertEqual(failed_login.status_code, 200)
+        self.assertIn("Email or password is incorrect.", failed_login.get_data(as_text=True))
+
+    def test_remember_me_and_logout(self):
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+        self.client.get("/login")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        response = self.client.post("/login", data={
+            "email": "tester@example.com",
+            "password": "Test-password-123",
+            "csrf_token": csrf_token,
+            "remember": "on",
+        })
+        self.assertEqual(response.status_code, 302)
+        with self.client.session_transaction() as current_session:
+            self.assertTrue(current_session.permanent)
+
+        self.client.get("/")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        logout_response = self.client.post("/logout", data={
+            "csrf_token": csrf_token,
+        })
+        self.assertEqual(logout_response.status_code, 302)
+        self.assertEqual(self.client.get("/").status_code, 302)
+
+    def test_setup_page_does_not_allow_a_second_account(self):
+        response = self.client.get("/setup")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response.headers["Location"])
+
+    def test_multiple_accounts_have_separate_financial_data(self):
+        created = self.create_expense()
+        expense_id = created.json["data"]["id"]
+        first_budget = self.client.post("/api/v1/budgets", json={
+            "amount": 500,
+            "month": "2026-10",
+            "category_id": self.category_id,
+        }).json["data"]
+
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+        registration_page = self.client.get("/register")
+        self.assertEqual(registration_page.status_code, 200)
+        self.assertIn(
+            "Create an account for your own expenses",
+            registration_page.get_data(as_text=True),
+        )
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        registration = self.client.post("/register", data={
+            "email": "second@example.com",
+            "password": "Another-password-123",
+            "confirm_password": "Another-password-123",
+            "csrf_token": csrf_token,
+        })
+        self.assertEqual(registration.status_code, 302)
+        self.assertEqual(self.client.get("/api/v1/expenses").json["pagination"]["total"], 0)
+        self.assertEqual(self.client.get("/api/v1/budgets").json["data"], [])
+        self.assertEqual(
+            self.client.get(f"/api/v1/expenses/{expense_id}").status_code, 404
+        )
+
+        categories = self.client.get("/api/v1/categories").json["data"]
+        second_food = next(category for category in categories if category["name"] == "Food")
+        self.assertNotEqual(second_food["id"], self.category_id)
+
+        budget = self.client.post("/api/v1/budgets", json={
+            "amount": 200,
+            "month": "2026-10",
+            "category_id": second_food["id"],
+        })
+        self.assertEqual(budget.status_code, 201)
+        self.assertEqual(budget.json["data"]["spent"], 0)
+        second_budget_id = budget.json["data"]["id"]
+
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+        self.client.get("/login")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["csrf_token"]
+        login = self.client.post("/login", data={
+            "email": "tester@example.com",
+            "password": "Test-password-123",
+            "csrf_token": csrf_token,
+        })
+        self.assertEqual(login.status_code, 302)
+        self.assertEqual(self.client.get("/api/v1/expenses").json["pagination"]["total"], 1)
+        account_budgets = self.client.get("/api/v1/budgets").json["data"]
+        self.assertEqual([item["id"] for item in account_budgets], [first_budget["id"]])
+        self.assertEqual(
+            self.client.get(f"/api/v1/budgets/{second_budget_id}").status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/categories/{second_food['id']}"
+            ).status_code,
+            404,
+        )
+
+    def test_html_pages_render_collapsible_sidebar_navigation(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="app-sidebar"', html)
+        self.assertIn('aria-controls="app-sidebar"', html)
+        self.assertIn('class="sidebar-nav"', html)
+        self.assertIn("aria-current=\"page\"", html)
+        for label in ("Dashboard", "Add Expense", "Categories", "Budgets", "Export CSV"):
+            with self.subTest(label=label):
+                self.assertIn(label, html)
+
     def test_dashboard_chart_refreshes_after_adding_expense(self):
         response = self.client.post("/add", data={
             "amount": "125.50",
@@ -168,6 +325,14 @@ class ExpenseApiTests(unittest.TestCase):
                     )
                 """)
                 conn.execute("""
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                        password_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("""
                     CREATE TABLE expenses (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         expense_date TEXT NOT NULL,
@@ -185,6 +350,10 @@ class ExpenseApiTests(unittest.TestCase):
                     )
                 """)
                 conn.execute("INSERT INTO categories (name) VALUES ('Food')")
+                conn.execute(
+                    "INSERT INTO users (id, email, password_hash) VALUES "
+                    "(1, 'tester@example.com', 'test-hash')"
+                )
                 conn.execute("""
                     INSERT INTO expenses (expense_date, category_id, amount, note)
                     VALUES ('2026-10-10', 1, 25, 'Legacy')
@@ -193,10 +362,17 @@ class ExpenseApiTests(unittest.TestCase):
             expense_app.init_db()
             with expense_app.connect_db() as conn:
                 migrated = conn.execute(
-                    "SELECT date, expense_date FROM expenses WHERE id = 1"
+                    "SELECT date, expense_date, user_id FROM expenses WHERE id = 1"
                 ).fetchone()
                 self.assertEqual(migrated["date"], "2026-10-10")
                 self.assertEqual(migrated["expense_date"], "2026-10-10")
+                self.assertEqual(migrated["user_id"], 1)
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT user_id FROM categories WHERE name = 'Food'"
+                    ).fetchone()["user_id"],
+                    1,
+                )
 
             web_response = self.client.post("/add", data={
                 "amount": "30",

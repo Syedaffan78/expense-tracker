@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Sign in | Expense Tracker{% endblock %}</title>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css', v='auth2') }}">
+</head>
+<body class="auth-body">
+    <main class="auth-layout">
+        <div class="auth-glow auth-glow-one" aria-hidden="true"></div>
+        <div class="auth-glow auth-glow-two" aria-hidden="true"></div>
+        <section class="auth-card" aria-labelledby="auth-title">
+            <a class="auth-brand" href="{{ url_for('login') }}">
+                <span class="brand-mark" aria-hidden="true">$</span>
+                <span>Expense Tracker</span>
+            </a>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="alert {{ category }}" role="status">{{ message }}</div>
+                {% endfor %}
+            {% endwith %}
+
+            {% block content %}{% endblock %}
+            <p class="auth-footnote">Your finances, thoughtfully organized.</p>
+        </section>
+    </main>
+</body>
+</html>

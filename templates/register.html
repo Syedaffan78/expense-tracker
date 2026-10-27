@@ -1,0 +1,79 @@
+{% extends "auth_base.html" %}
+
+{% block title %}Create your account | Expense Tracker{% endblock %}
+
+{% block content %}
+<div class="auth-heading">
+    <span class="auth-eyebrow">YOUR OWN PRIVATE SPACE</span>
+    <h1 id="auth-title">Start fresh.</h1>
+    <p>Create an account for your own expenses, budgets, and categories.</p>
+</div>
+
+<form class="auth-form" method="POST" action="{{ url_for('register') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" autocomplete="email"
+           placeholder="you@example.com" maxlength="254" required autofocus>
+
+    <label for="password">Create a password</label>
+    <div class="password-field">
+        <input id="password" name="password" type="password"
+               autocomplete="new-password" placeholder="At least 10 characters"
+               minlength="10" maxlength="1024" required>
+        <button class="password-toggle" type="button" aria-label="Show password"
+                aria-pressed="false" data-password-toggle="password">Show</button>
+    </div>
+    <div class="strength-track" aria-hidden="true">
+        <span class="strength-meter"></span>
+    </div>
+    <p class="strength-caption" aria-live="polite">Use 10 or more characters.</p>
+
+    <label for="confirm-password">Confirm password</label>
+    <div class="password-field">
+        <input id="confirm-password" name="confirm_password" type="password"
+               autocomplete="new-password" placeholder="Enter it again"
+               maxlength="1024" required>
+        <button class="password-toggle" type="button" aria-label="Show confirmation"
+                aria-pressed="false" data-password-toggle="confirm-password">Show</button>
+    </div>
+
+    <button class="auth-submit" type="submit">Create account <span aria-hidden="true">→</span></button>
+</form>
+
+<p class="auth-switch">Already have an account? <a href="{{ url_for('login') }}">Sign in</a></p>
+
+<script>
+document.querySelectorAll("[data-password-toggle]").forEach(function (button) {
+    button.addEventListener("click", function () {
+        const field = document.getElementById(button.dataset.passwordToggle);
+        const visible = field.type === "password";
+        field.type = visible ? "text" : "password";
+        button.textContent = visible ? "Hide" : "Show";
+        button.setAttribute("aria-label", visible ? "Hide password" : "Show password");
+        button.setAttribute("aria-pressed", String(visible));
+        field.focus();
+    });
+});
+
+const setupPassword = document.getElementById("password");
+const meter = document.querySelector(".strength-meter");
+const caption = document.querySelector(".strength-caption");
+setupPassword.addEventListener("input", function () {
+    const value = setupPassword.value;
+    let score = 0;
+    if (value.length >= 10) score++;
+    if (value.length >= 14) score++;
+    if (/[a-z]/.test(value) && /[A-Z]/.test(value)) score++;
+    if (/\d/.test(value)) score++;
+    if (/[^a-zA-Z0-9]/.test(value)) score++;
+
+    const labels = ["Add more variety", "Getting started", "Fair", "Good", "Strong", "Excellent"];
+    meter.style.width = (score * 20) + "%";
+    meter.dataset.strength = score < 2 ? "low" : score < 4 ? "medium" : "high";
+    caption.textContent = value.length < 10
+        ? "Use 10 or more characters."
+        : "Password strength: " + labels[score] + ".";
+});
+</script>
+{% endblock %}

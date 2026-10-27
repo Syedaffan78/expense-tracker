@@ -1,19 +1,31 @@
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, flash, make_response
+    url_for, flash, make_response, session, g
 )
 from werkzeug.exceptions import BadRequest
+from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3
 import csv
 import io
 import math
 import os
+import re
+import secrets
+import hmac
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-only-key")
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "").lower()
+    in ("1", "true", "yes"),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
 
 DATABASE = Path(os.environ.get(
     "EXPENSES_DATABASE", Path(__file__).resolve().parent / "expenses.db"
@@ -45,7 +57,8 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
+                name TEXT NOT NULL,
+                user_id INTEGER
             )
         """)
         conn.execute("""
@@ -55,6 +68,7 @@ def init_db():
                 category_id INTEGER NOT NULL,
                 date TEXT,
                 note TEXT DEFAULT '',
+                user_id INTEGER,
                 FOREIGN KEY (category_id) REFERENCES categories(id)
             )
         """)
@@ -65,7 +79,16 @@ def init_db():
                 amount REAL NOT NULL,
                 month TEXT NOT NULL,
                 category_id INTEGER,
+                user_id INTEGER,
                 FOREIGN KEY (category_id) REFERENCES categories(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -73,7 +96,28 @@ def init_db():
         def columns(table):
             return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
 
+        cat_cols = columns("categories")
         exp_cols, bud_cols = columns("expenses"), columns("budgets")
+
+        if "user_id" not in cat_cols:
+            conn.execute("ALTER TABLE categories ADD COLUMN user_id INTEGER")
+            conn.execute("""
+                CREATE TABLE categories_scoped (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    user_id INTEGER
+                )
+            """)
+            conn.execute("""
+                INSERT INTO categories_scoped (id, name, user_id)
+                SELECT id, name, user_id FROM categories
+            """)
+            conn.execute("DROP TABLE categories")
+            conn.execute("ALTER TABLE categories_scoped RENAME TO categories")
+        if "user_id" not in exp_cols:
+            conn.execute("ALTER TABLE expenses ADD COLUMN user_id INTEGER")
+        if "user_id" not in bud_cols:
+            conn.execute("ALTER TABLE budgets ADD COLUMN user_id INTEGER")
 
         if "date" not in exp_cols:
             conn.execute("ALTER TABLE expenses ADD COLUMN date TEXT")
@@ -107,12 +151,6 @@ def init_db():
                 WHERE expense_date IS NULL OR TRIM(expense_date) = ''
             """)
 
-        for category in DEFAULT_CATEGORIES:
-            conn.execute(
-                "INSERT OR IGNORE INTO categories (name) VALUES (?)",
-                (category,)
-            )
-
         if "name" not in bud_cols:
             conn.execute("""
                 UPDATE budgets
@@ -122,8 +160,249 @@ def init_db():
                 )
             """)
 
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_user_name
+            ON categories(user_id, name COLLATE NOCASE)
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id)")
+
+        first_user = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+        if first_user is not None:
+            user_id = first_user["id"]
+            conn.execute("UPDATE categories SET user_id = ? WHERE user_id IS NULL", (user_id,))
+            conn.execute("UPDATE expenses SET user_id = ? WHERE user_id IS NULL", (user_id,))
+            conn.execute("UPDATE budgets SET user_id = ? WHERE user_id IS NULL", (user_id,))
+            for category in DEFAULT_CATEGORIES:
+                conn.execute(
+                    "INSERT OR IGNORE INTO categories (name, user_id) VALUES (?, ?)",
+                    (category, user_id),
+                )
+
+
+def create_account(conn, email, password):
+    cursor = conn.execute(
+        "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+        (email, generate_password_hash(password)),
+    )
+    user_id = cursor.lastrowid
+    conn.execute(
+        "UPDATE categories SET user_id = ? WHERE user_id IS NULL", (user_id,)
+    )
+    conn.execute("UPDATE expenses SET user_id = ? WHERE user_id IS NULL", (user_id,))
+    conn.execute("UPDATE budgets SET user_id = ? WHERE user_id IS NULL", (user_id,))
+    for category in DEFAULT_CATEGORIES:
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name, user_id) VALUES (?, ?)",
+            (category, user_id),
+        )
+    return user_id
+
 
 init_db()
+
+
+# ==============================
+# AUTHENTICATION
+# ==============================
+
+def csrf_token():
+    token = session.get("csrf_token")
+    if token is None:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+def has_account():
+    with connect_db() as conn:
+        return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+
+
+def valid_csrf_token():
+    submitted = request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    return bool(submitted and expected and hmac.compare_digest(submitted, expected))
+
+
+def safe_next_url(target):
+    if not target:
+        return None
+    parsed = urlsplit(target)
+    if (
+        parsed.scheme or parsed.netloc or "\\" in target
+        or not parsed.path.startswith("/") or parsed.path.startswith("//")
+    ):
+        return None
+    return target
+
+
+@app.before_request
+def require_login():
+    if request.endpoint is None or request.endpoint == "static":
+        return None
+    if request.endpoint in ("login", "setup", "register"):
+        return None
+
+    user_id = session.get("user_id")
+    if user_id is not None:
+        with connect_db() as conn:
+            user = conn.execute(
+                "SELECT id, email FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        if user is not None:
+            g.current_user = user
+            return None
+        session.clear()
+
+    destination = "login" if has_account() else "setup"
+    if request.path.startswith("/api/"):
+        return {"error": {"message": "Authentication required."}}, 401
+    if destination == "login":
+        return redirect(url_for(destination, next=request.full_path.rstrip("?")))
+    return redirect(url_for(destination))
+
+
+@app.after_request
+def prevent_private_page_caching(response):
+    endpoint = request.endpoint or ""
+    if endpoint != "static" and not endpoint.startswith("api_"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    if has_account():
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("setup"))
+
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirmation = request.form.get("confirm_password", "")
+
+        if (
+            len(email) > 254
+            or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+        ):
+            flash("Enter a valid email address.", "error")
+        elif len(password) < 10:
+            flash("Choose a password with at least 10 characters.", "error")
+        elif len(password) > 1024:
+            flash("Choose a shorter password.", "error")
+        elif password != confirmation:
+            flash("The passwords do not match.", "error")
+        else:
+            try:
+                with connect_db() as conn:
+                    create_account(conn, email, password)
+            except sqlite3.IntegrityError:
+                flash("An account already exists. Please sign in.", "error")
+                return redirect(url_for("login"))
+
+            session.clear()
+            flash("Your account is ready. Sign in to continue.", "success")
+            return redirect(url_for("login"))
+
+    return render_template("setup.html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if session.get("user_id") is not None:
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("register"))
+
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirmation = request.form.get("confirm_password", "")
+
+        if (
+            len(email) > 254
+            or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+        ):
+            flash("Enter a valid email address.", "error")
+        elif len(password) < 10:
+            flash("Choose a password with at least 10 characters.", "error")
+        elif len(password) > 1024:
+            flash("Choose a shorter password.", "error")
+        elif password != confirmation:
+            flash("The passwords do not match.", "error")
+        else:
+            try:
+                with connect_db() as conn:
+                    user_id = create_account(conn, email, password)
+            except sqlite3.IntegrityError:
+                flash("An account with that email already exists.", "error")
+            else:
+                session.clear()
+                session["user_id"] = user_id
+                flash("Your private account is ready.", "success")
+                return redirect(url_for("index"))
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not has_account():
+        return redirect(url_for("setup"))
+    if session.get("user_id") is not None:
+        return redirect(url_for("index"))
+
+    next_url = safe_next_url(
+        request.form.get("next") if request.method == "POST"
+        else request.args.get("next")
+    )
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("login"))
+
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "")
+        if len(password) > 1024:
+            flash("Email or password is incorrect.", "error")
+            return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
+
+        with connect_db() as conn:
+            user = conn.execute(
+                "SELECT id, email, password_hash FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+
+        if user is None or not check_password_hash(user["password_hash"], password):
+            flash("Email or password is incorrect.", "error")
+            return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
+
+        session.clear()
+        session["user_id"] = user["id"]
+        session.permanent = request.form.get("remember") == "on"
+        return redirect(next_url or url_for("index"))
+
+    return render_template("login.html", next_url=next_url)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    if not valid_csrf_token():
+        flash("Your session expired. Please try again.", "error")
+        return redirect(url_for("index"))
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("login"))
 
 
 # ==============================
@@ -138,10 +417,15 @@ def money(value):
         return "₹0.00"
 
 
+def current_user_id():
+    return g.current_user["id"]
+
+
 def get_categories():
     with connect_db() as conn:
         return conn.execute(
-            "SELECT * FROM categories ORDER BY name"
+            "SELECT * FROM categories WHERE user_id = ? ORDER BY name",
+            (current_user_id(),),
         ).fetchall()
 
 
@@ -153,12 +437,15 @@ def insert_expense(conn, expense):
     date_placeholders = ", ".join("?" for _ in date_columns)
     cursor = conn.execute(
         f"""
-        INSERT INTO expenses (amount, category_id, {', '.join(date_columns)}, note)
-        VALUES (?, ?, {date_placeholders}, ?)
+        INSERT INTO expenses (
+            amount, category_id, {', '.join(date_columns)}, note, user_id
+        )
+        VALUES (?, ?, {date_placeholders}, ?, ?)
         """,
         (
             expense["amount"], expense["category_id"],
             *[expense["date"] for _ in date_columns], expense["note"],
+            current_user_id(),
         ),
     )
     return cursor.lastrowid
@@ -174,11 +461,12 @@ def update_expense(conn, expense, expense_id):
         f"""
         UPDATE expenses
         SET amount = ?, category_id = ?, {date_assignments}, note = ?
-        WHERE id = ?
+        WHERE id = ? AND user_id = ?
         """,
         (
             expense["amount"], expense["category_id"],
             *[expense["date"] for _ in date_columns], expense["note"], expense_id,
+            current_user_id(),
         ),
     )
 
@@ -203,7 +491,8 @@ def validate_expense_form():
 
     with connect_db() as conn:
         category = conn.execute(
-            "SELECT id FROM categories WHERE id = ?", (category_id,)
+            "SELECT id FROM categories WHERE id = ? AND user_id = ?",
+            (category_id, current_user_id()),
         ).fetchone()
 
     if category is None:
@@ -244,26 +533,29 @@ def index():
             SELECT expenses.*, categories.name AS category_name
             FROM expenses
             LEFT JOIN categories ON expenses.category_id = categories.id
+            WHERE expenses.user_id = ?
             ORDER BY expenses.date ASC, expenses.id ASC
-        """).fetchall()
+        """, (current_user_id(),)).fetchall()
 
         total = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses"
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE user_id = ?",
+            (current_user_id(),),
         ).fetchone()[0]
 
         today_total = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE date = ?",
-            (today.isoformat(),)
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE date = ? AND user_id = ?",
+            (today.isoformat(), current_user_id()),
         ).fetchone()[0]
 
         month_total = conn.execute("""
             SELECT COALESCE(SUM(amount), 0)
             FROM expenses
-            WHERE substr(date, 1, 7) = ?
-        """, (current_month,)).fetchone()[0]
+            WHERE substr(date, 1, 7) = ? AND user_id = ?
+        """, (current_month, current_user_id())).fetchone()[0]
 
         highest = conn.execute(
-            "SELECT COALESCE(MAX(amount), 0) FROM expenses"
+            "SELECT COALESCE(MAX(amount), 0) FROM expenses WHERE user_id = ?",
+            (current_user_id(),),
         ).fetchone()[0]
 
         category_totals = conn.execute("""
@@ -273,31 +565,34 @@ def index():
             LEFT JOIN expenses
                 ON categories.id = expenses.category_id
                 AND substr(expenses.date, 1, 7) = ?
+                AND expenses.user_id = ?
+            WHERE categories.user_id = ?
             GROUP BY categories.id, categories.name
             ORDER BY total DESC
-        """, (current_month,)).fetchall()
+        """, (current_month, current_user_id(), current_user_id())).fetchall()
 
         monthly = conn.execute("""
             SELECT substr(date, 1, 7) AS month, SUM(amount) AS total
             FROM expenses
             WHERE date >= date('now', 'localtime', 'start of month', '-5 months')
+                AND user_id = ?
             GROUP BY substr(date, 1, 7)
             ORDER BY month
-        """).fetchall()
+        """, (current_user_id(),)).fetchall()
 
         overall_budget = conn.execute("""
             SELECT COALESCE(SUM(amount), 0)
             FROM budgets
-            WHERE month = ? AND category_id IS NULL
-        """, (current_month,)).fetchone()[0]
+            WHERE month = ? AND category_id IS NULL AND user_id = ?
+        """, (current_month, current_user_id())).fetchone()[0]
 
         category_budgets = conn.execute("""
             SELECT budgets.*, categories.name AS category_name
             FROM budgets
             LEFT JOIN categories ON budgets.category_id = categories.id
-            WHERE budgets.month = ?
+            WHERE budgets.month = ? AND budgets.user_id = ?
             ORDER BY budgets.id DESC
-        """, (current_month,)).fetchall()
+        """, (current_month, current_user_id())).fetchall()
 
     # Apply dashboard filters without changing stored expenses.
     expenses = list(all_expenses)
@@ -378,7 +673,8 @@ def add_expense():
 def edit_expense(expense_id):
     with connect_db() as conn:
         expense = conn.execute(
-            "SELECT * FROM expenses WHERE id = ?", (expense_id,)
+            "SELECT * FROM expenses WHERE id = ? AND user_id = ?",
+            (expense_id, current_user_id()),
         ).fetchone()
 
     if expense is None:
@@ -410,7 +706,10 @@ def edit_expense(expense_id):
 @app.route("/delete/<int:expense_id>", methods=["POST"])
 def delete_expense(expense_id):
     with connect_db() as conn:
-        conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        conn.execute(
+            "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+            (expense_id, current_user_id()),
+        )
 
     flash("Expense deleted.", "success")
     return redirect(url_for("index"))
@@ -419,7 +718,7 @@ def delete_expense(expense_id):
 @app.route("/delete-all", methods=["POST"])
 def delete_all():
     with connect_db() as conn:
-        conn.execute("DELETE FROM expenses")
+        conn.execute("DELETE FROM expenses WHERE user_id = ?", (current_user_id(),))
 
     flash("All expenses deleted.", "success")
     return redirect(url_for("index"))
@@ -440,7 +739,8 @@ def categories():
             try:
                 with connect_db() as conn:
                     conn.execute(
-                        "INSERT INTO categories (name) VALUES (?)", (name,)
+                        "INSERT INTO categories (name, user_id) VALUES (?, ?)",
+                        (name, current_user_id()),
                     )
                 flash("Category added successfully!", "success")
             except sqlite3.IntegrityError:
@@ -455,16 +755,22 @@ def categories():
 def delete_category(category_id):
     with connect_db() as conn:
         used = conn.execute(
-            "SELECT COUNT(*) FROM expenses WHERE category_id = ?",
-            (category_id,)
+            "SELECT COUNT(*) FROM expenses WHERE category_id = ? AND user_id = ?",
+            (category_id, current_user_id()),
         ).fetchone()[0]
 
         if used:
             flash("Cannot delete a category that has existing expenses.", "error")
             return redirect(url_for("categories"))
 
-        conn.execute("DELETE FROM budgets WHERE category_id = ?", (category_id,))
-        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        conn.execute(
+            "DELETE FROM budgets WHERE category_id = ? AND user_id = ?",
+            (category_id, current_user_id()),
+        )
+        conn.execute(
+            "DELETE FROM categories WHERE id = ? AND user_id = ?",
+            (category_id, current_user_id()),
+        )
 
     flash("Category deleted.", "success")
     return redirect(url_for("categories"))
@@ -508,7 +814,8 @@ def budgets():
 
             with connect_db() as conn:
                 category = conn.execute(
-                    "SELECT name FROM categories WHERE id = ?", (category_id,)
+                    "SELECT name FROM categories WHERE id = ? AND user_id = ?",
+                    (category_id, current_user_id()),
                 ).fetchone()
 
             if category is None:
@@ -519,9 +826,9 @@ def budgets():
 
         with connect_db() as conn:
             conn.execute("""
-                INSERT INTO budgets (name, amount, month, category_id)
-                VALUES (?, ?, ?, ?)
-            """, (budget_name, amount, month, category_id))
+                INSERT INTO budgets (name, amount, month, category_id, user_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (budget_name, amount, month, category_id, current_user_id()))
 
         flash("Budget saved successfully!", "success")
         return redirect(url_for("budgets"))
@@ -531,8 +838,9 @@ def budgets():
             SELECT budgets.*, categories.name AS category_name
             FROM budgets
             LEFT JOIN categories ON budgets.category_id = categories.id
+            WHERE budgets.user_id = ?
             ORDER BY budgets.month DESC, budgets.id DESC
-        """).fetchall()
+        """, (current_user_id(),)).fetchall()
 
     return render_template(
         "budgets.html",
@@ -545,7 +853,10 @@ def budgets():
 @app.route("/budgets/delete/<int:budget_id>", methods=["POST"])
 def delete_budget(budget_id):
     with connect_db() as conn:
-        conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
+        conn.execute(
+            "DELETE FROM budgets WHERE id = ? AND user_id = ?",
+            (budget_id, current_user_id()),
+        )
 
     flash("Budget deleted.", "success")
     return redirect(url_for("budgets"))
@@ -568,8 +879,9 @@ def export_expenses():
                    expenses.date, expenses.note
             FROM expenses
             LEFT JOIN categories ON expenses.category_id = categories.id
+            WHERE expenses.user_id = ?
             ORDER BY expenses.date DESC
-        """).fetchall()
+        """, (current_user_id(),)).fetchall()
 
     for r in rows:
         writer.writerow([
@@ -686,8 +998,8 @@ def api_get_expense(conn, expense_id):
         SELECT expenses.*, categories.name AS category_name
         FROM expenses
         LEFT JOIN categories ON expenses.category_id = categories.id
-        WHERE expenses.id = ?
-    """, (expense_id,)).fetchone()
+        WHERE expenses.id = ? AND expenses.user_id = ?
+    """, (expense_id, current_user_id())).fetchone()
 
 
 def api_budget_row(row):
@@ -760,8 +1072,8 @@ def api_expenses():
             return error
         with connect_db() as conn:
             category = conn.execute(
-                "SELECT id FROM categories WHERE id = ?",
-                (values["category_id"],),
+                "SELECT id FROM categories WHERE id = ? AND user_id = ?",
+                (values["category_id"], current_user_id()),
             ).fetchone()
             if category is None:
                 return api_error("Category does not exist.", 400, "category_id")
@@ -800,7 +1112,7 @@ def api_expenses():
     except ValueError:
         return api_error("Limit must be 1-100 and offset must be zero or greater.", 400)
 
-    clauses, params = [], []
+    clauses, params = ["expenses.user_id = ?"], [current_user_id()]
     if "category_id" in filters:
         clauses.append("expenses.category_id = ?")
         params.append(filters["category_id"])
@@ -844,7 +1156,10 @@ def api_expense(expense_id):
         if request.method == "GET":
             return {"data": api_expense_row(row)}
         if request.method == "DELETE":
-            conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+            conn.execute(
+                "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+                (expense_id, current_user_id()),
+            )
             return "", 204
 
         payload, error = api_json_object()
@@ -862,7 +1177,8 @@ def api_expense(expense_id):
         if error:
             return error
         category = conn.execute(
-            "SELECT id FROM categories WHERE id = ?", (values["category_id"],)
+            "SELECT id FROM categories WHERE id = ? AND user_id = ?",
+            (values["category_id"], current_user_id()),
         ).fetchone()
         if category is None:
             return api_error("Category does not exist.", 400, "category_id")
@@ -885,10 +1201,12 @@ def api_categories():
         try:
             with connect_db() as conn:
                 cursor = conn.execute(
-                    "INSERT INTO categories (name) VALUES (?)", (name.strip(),)
+                    "INSERT INTO categories (name, user_id) VALUES (?, ?)",
+                    (name.strip(), current_user_id()),
                 )
                 category = conn.execute(
-                    "SELECT id, name FROM categories WHERE id = ?", (cursor.lastrowid,)
+                    "SELECT id, name FROM categories WHERE id = ? AND user_id = ?",
+                    (cursor.lastrowid, current_user_id()),
                 ).fetchone()
         except sqlite3.IntegrityError:
             return api_error("Category already exists.", 409, "name")
@@ -900,9 +1218,11 @@ def api_categories():
             SELECT categories.id, categories.name, COUNT(expenses.id) AS expense_count
             FROM categories
             LEFT JOIN expenses ON expenses.category_id = categories.id
+                AND expenses.user_id = ?
+            WHERE categories.user_id = ?
             GROUP BY categories.id, categories.name
             ORDER BY categories.name
-        """).fetchall()
+        """, (current_user_id(), current_user_id())).fetchall()
     return {"data": [dict(row) for row in rows]}
 
 
@@ -910,7 +1230,8 @@ def api_categories():
 def api_category(category_id):
     with connect_db() as conn:
         row = conn.execute(
-            "SELECT id, name FROM categories WHERE id = ?", (category_id,)
+            "SELECT id, name FROM categories WHERE id = ? AND user_id = ?",
+            (category_id, current_user_id()),
         ).fetchone()
         if row is None:
             return api_error("Category not found.", 404)
@@ -918,13 +1239,19 @@ def api_category(category_id):
             return {"data": dict(row)}
         if request.method == "DELETE":
             used = conn.execute(
-                "SELECT COUNT(*) FROM expenses WHERE category_id = ?",
-                (category_id,),
+                "SELECT COUNT(*) FROM expenses WHERE category_id = ? AND user_id = ?",
+                (category_id, current_user_id()),
             ).fetchone()[0]
             if used:
                 return api_error("Cannot delete a category used by expenses.", 409)
-            conn.execute("DELETE FROM budgets WHERE category_id = ?", (category_id,))
-            conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+            conn.execute(
+                "DELETE FROM budgets WHERE category_id = ? AND user_id = ?",
+                (category_id, current_user_id()),
+            )
+            conn.execute(
+                "DELETE FROM categories WHERE id = ? AND user_id = ?",
+                (category_id, current_user_id()),
+            )
             return "", 204
 
         payload, error = api_json_object()
@@ -937,13 +1264,14 @@ def api_category(category_id):
             return api_error("Name must contain 1-50 characters.", 400, "name")
         try:
             conn.execute(
-                "UPDATE categories SET name = ? WHERE id = ?",
-                (name.strip(), category_id),
+                "UPDATE categories SET name = ? WHERE id = ? AND user_id = ?",
+                (name.strip(), category_id, current_user_id()),
             )
         except sqlite3.IntegrityError:
             return api_error("Category already exists.", 409, "name")
         updated = conn.execute(
-            "SELECT id, name FROM categories WHERE id = ?", (category_id,)
+            "SELECT id, name FROM categories WHERE id = ? AND user_id = ?",
+            (category_id, current_user_id()),
         ).fetchone()
         return {"data": dict(updated)}
 
@@ -961,31 +1289,33 @@ def api_budgets():
             category_name = None
             if values["category_id"] is not None:
                 category = conn.execute(
-                    "SELECT name FROM categories WHERE id = ?",
-                    (values["category_id"],),
+                    "SELECT name FROM categories WHERE id = ? AND user_id = ?",
+                    (values["category_id"], current_user_id()),
                 ).fetchone()
                 if category is None:
                     return api_error("Category does not exist.", 400, "category_id")
                 category_name = category["name"]
             cursor = conn.execute("""
-                INSERT INTO budgets (name, amount, month, category_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO budgets (name, amount, month, category_id, user_id)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 category_name or "Overall Budget",
                 values["amount"], values["month"], values["category_id"],
+                current_user_id(),
             ))
             row = conn.execute("""
                 SELECT budgets.*, categories.name AS category_name,
                        COALESCE((
                            SELECT SUM(expenses.amount) FROM expenses
                            WHERE substr(expenses.date, 1, 7) = budgets.month
+                           AND expenses.user_id = budgets.user_id
                            AND (budgets.category_id IS NULL
                                 OR expenses.category_id = budgets.category_id)
                        ), 0) AS spent
                 FROM budgets
                 LEFT JOIN categories ON categories.id = budgets.category_id
-                WHERE budgets.id = ?
-            """, (cursor.lastrowid,)).fetchone()
+                WHERE budgets.id = ? AND budgets.user_id = ?
+            """, (cursor.lastrowid, current_user_id())).fetchone()
         result = api_budget_row(row)
         return {"data": result}, 201, {"Location": url_for("api_budget", budget_id=result["id"])}
 
@@ -997,16 +1327,18 @@ def api_budgets():
                COALESCE((
                    SELECT SUM(expenses.amount) FROM expenses
                    WHERE substr(expenses.date, 1, 7) = budgets.month
+                   AND expenses.user_id = budgets.user_id
                    AND (budgets.category_id IS NULL
                         OR expenses.category_id = budgets.category_id)
                ), 0) AS spent
         FROM budgets
         LEFT JOIN categories ON categories.id = budgets.category_id
+        WHERE budgets.user_id = ?
     """
-    params = ()
+    params = [current_user_id()]
     if month:
-        query += " WHERE budgets.month = ?"
-        params = (month,)
+        query += " AND budgets.month = ?"
+        params.append(month)
     query += " ORDER BY budgets.month DESC, budgets.id DESC"
     with connect_db() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -1020,8 +1352,8 @@ def api_budget(budget_id):
             SELECT budgets.*, categories.name AS category_name
             FROM budgets
             LEFT JOIN categories ON categories.id = budgets.category_id
-            WHERE budgets.id = ?
-        """, (budget_id,)).fetchone()
+            WHERE budgets.id = ? AND budgets.user_id = ?
+        """, (budget_id, current_user_id())).fetchone()
         if row is None:
             return api_error("Budget not found.", 404)
         if request.method == "GET":
@@ -1030,16 +1362,20 @@ def api_budget(budget_id):
                        COALESCE((
                            SELECT SUM(expenses.amount) FROM expenses
                            WHERE substr(expenses.date, 1, 7) = budgets.month
+                           AND expenses.user_id = budgets.user_id
                            AND (budgets.category_id IS NULL
                                 OR expenses.category_id = budgets.category_id)
                        ), 0) AS spent
                 FROM budgets
                 LEFT JOIN categories ON categories.id = budgets.category_id
-                WHERE budgets.id = ?
-            """, (budget_id,)).fetchone()
+                WHERE budgets.id = ? AND budgets.user_id = ?
+            """, (budget_id, current_user_id())).fetchone()
             return {"data": api_budget_row(budget)}
         if request.method == "DELETE":
-            conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
+            conn.execute(
+                "DELETE FROM budgets WHERE id = ? AND user_id = ?",
+                (budget_id, current_user_id()),
+            )
             return "", 204
 
         payload, error = api_json_object()
@@ -1058,31 +1394,33 @@ def api_budget(budget_id):
         category_name = None
         if values["category_id"] is not None:
             category = conn.execute(
-                "SELECT name FROM categories WHERE id = ?",
-                (values["category_id"],),
+                "SELECT name FROM categories WHERE id = ? AND user_id = ?",
+                (values["category_id"], current_user_id()),
             ).fetchone()
             if category is None:
                 return api_error("Category does not exist.", 400, "category_id")
             category_name = category["name"]
         conn.execute("""
             UPDATE budgets SET name = ?, amount = ?, month = ?, category_id = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
         """, (
             category_name or "Overall Budget",
             values["amount"], values["month"], values["category_id"], budget_id,
+            current_user_id(),
         ))
         updated = conn.execute("""
             SELECT budgets.*, categories.name AS category_name,
                    COALESCE((
                        SELECT SUM(expenses.amount) FROM expenses
                        WHERE substr(expenses.date, 1, 7) = budgets.month
+                       AND expenses.user_id = budgets.user_id
                        AND (budgets.category_id IS NULL
                             OR expenses.category_id = budgets.category_id)
                    ), 0) AS spent
             FROM budgets
             LEFT JOIN categories ON categories.id = budgets.category_id
-            WHERE budgets.id = ?
-        """, (budget_id,)).fetchone()
+            WHERE budgets.id = ? AND budgets.user_id = ?
+        """, (budget_id, current_user_id())).fetchone()
         return {"data": api_budget_row(updated)}
 
 
