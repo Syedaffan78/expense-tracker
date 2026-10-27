@@ -641,6 +641,90 @@ p {
     box-shadow: var(--shadow-subtle);
 }
 
+.sticker-picker {
+    min-width: 0;
+    margin: 4px 0;
+    padding: 0;
+    border: 0;
+}
+
+.sticker-picker legend {
+    margin-bottom: 10px;
+    color: var(--color-ink);
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.sticker-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+    gap: 8px;
+}
+
+.sticker-option {
+    position: relative;
+    display: flex;
+    min-height: 78px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 7px;
+    border: 1px solid var(--color-stone);
+    border-radius: 10px;
+    background: var(--color-paper);
+    cursor: pointer;
+    transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.sticker-option:hover,
+.sticker-option:has(input:checked) {
+    border-color: var(--color-ember-orange);
+    background: rgb(255 105 45 / 6%);
+}
+
+.sticker-option input {
+    position: absolute;
+    width: 1px;
+    min-height: 1px;
+    height: 1px;
+    margin: 0;
+    padding: 0;
+    opacity: 0;
+}
+
+.sticker-option input:focus-visible + .sticker-emoji {
+    outline: 3px solid rgb(255 105 45 / 42%);
+    outline-offset: 3px;
+}
+
+.sticker-option input:checked + .sticker-emoji {
+    background: rgb(255 105 45 / 12%);
+}
+
+.sticker-emoji {
+    display: grid;
+    width: 38px;
+    height: 38px;
+    place-items: center;
+    border-radius: 9px;
+    font-size: 25px;
+}
+
+.sticker-name {
+    color: var(--color-graphite);
+    font-size: 11px;
+    line-height: 1.2;
+}
+
+.expense-sticker {
+    font-size: 22px;
+}
+
+.muted {
+    color: var(--color-graphite);
+}
+
 label {
     color: var(--color-ink);
     font-size: 14px;

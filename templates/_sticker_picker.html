@@ -1,0 +1,27 @@
+<fieldset class="sticker-picker">
+    <legend>Choose a sticker (optional)</legend>
+    <div class="sticker-options">
+        <label class="sticker-option">
+            <input
+                type="radio"
+                name="sticker"
+                value=""
+                {% if not selected_sticker %}checked{% endif %}
+            >
+            <span class="sticker-emoji" aria-hidden="true">✕</span>
+            <span class="sticker-name">None</span>
+        </label>
+        {% for sticker, label in expense_stickers %}
+        <label class="sticker-option">
+            <input
+                type="radio"
+                name="sticker"
+                value="{{ sticker }}"
+                {% if selected_sticker == sticker %}checked{% endif %}
+            >
+            <span class="sticker-emoji" aria-hidden="true">{{ sticker }}</span>
+            <span class="sticker-name">{{ label }}</span>
+        </label>
+        {% endfor %}
+    </div>
+</fieldset>

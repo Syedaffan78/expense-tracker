@@ -52,6 +52,9 @@
         maxlength="500"
     >{{ expense.note }}</textarea>
 
+    {% set selected_sticker = expense.sticker or "" %}
+    {% include "_sticker_picker.html" %}
+
     <button type="submit">Update Expense</button>
 
     <a href="{{ url_for('index') }}">Cancel</a>

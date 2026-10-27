@@ -94,6 +94,7 @@ class ExpenseApiTests(unittest.TestCase):
     def test_expense_validation_and_content_type(self):
         self.assertEqual(self.create_expense(amount=float("inf")).status_code, 400)
         self.assertEqual(self.create_expense(category_id=999999).status_code, 400)
+        self.assertEqual(self.create_expense(sticker="💸").status_code, 400)
         self.assertEqual(
             self.client.post("/api/v1/expenses", data="{}", content_type="text/plain").status_code,
             415,
@@ -104,6 +105,22 @@ class ExpenseApiTests(unittest.TestCase):
             ).status_code,
             400,
         )
+
+    def test_expense_sticker_is_saved_and_can_be_changed_or_cleared(self):
+        created = self.create_expense(sticker="🍕")
+        self.assertEqual(created.status_code, 201)
+        expense_id = created.json["data"]["id"]
+        self.assertEqual(created.json["data"]["sticker"], "🍕")
+
+        updated = self.client.patch(
+            f"/api/v1/expenses/{expense_id}", json={"note": "Dinner"}
+        )
+        self.assertEqual(updated.json["data"]["sticker"], "🍕")
+
+        cleared = self.client.patch(
+            f"/api/v1/expenses/{expense_id}", json={"sticker": ""}
+        )
+        self.assertEqual(cleared.json["data"]["sticker"], "")
 
     def test_category_conflicts_with_existing_expenses(self):
         created = self.create_expense()
@@ -298,6 +315,29 @@ class ExpenseApiTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn(label, html)
 
+    def test_expense_forms_offer_stickers_and_dashboard_displays_selection(self):
+        add_page = self.client.get("/add")
+        self.assertEqual(add_page.status_code, 200)
+        self.assertEqual(add_page.get_data(as_text=True).count('name="sticker"'), 17)
+
+        response = self.client.post("/add", data={
+            "amount": "125.50",
+            "category_id": str(self.category_id),
+            "date": date.today().isoformat(),
+            "note": "Lunch",
+            "sticker": "🍕",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('aria-label="Expense sticker: 🍕"', response.get_data(as_text=True))
+
+        with expense_app.connect_db() as conn:
+            expense_id = conn.execute(
+                "SELECT id FROM expenses WHERE sticker = '🍕'"
+            ).fetchone()["id"]
+        edit_page = self.client.get(f"/edit/{expense_id}")
+        self.assertEqual(edit_page.status_code, 200)
+        self.assertRegex(edit_page.get_data(as_text=True), r'value="🍕"\s+checked')
+
     def test_dashboard_chart_refreshes_after_adding_expense(self):
         response = self.client.post("/add", data={
             "amount": "125.50",
@@ -362,10 +402,12 @@ class ExpenseApiTests(unittest.TestCase):
             expense_app.init_db()
             with expense_app.connect_db() as conn:
                 migrated = conn.execute(
-                    "SELECT date, expense_date, user_id FROM expenses WHERE id = 1"
+                    "SELECT date, expense_date, sticker, user_id "
+                    "FROM expenses WHERE id = 1"
                 ).fetchone()
                 self.assertEqual(migrated["date"], "2026-10-10")
                 self.assertEqual(migrated["expense_date"], "2026-10-10")
+                self.assertEqual(migrated["sticker"], "")
                 self.assertEqual(migrated["user_id"], 1)
                 self.assertEqual(
                     conn.execute(

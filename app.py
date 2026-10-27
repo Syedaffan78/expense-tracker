@@ -36,6 +36,26 @@ DEFAULT_CATEGORIES = [
     "Education", "Health", "Entertainment", "Other"
 ]
 
+EXPENSE_STICKERS = [
+    ("🍕", "Pizza"),
+    ("☕", "Coffee"),
+    ("🛒", "Shopping"),
+    ("🚗", "Transport"),
+    ("🏠", "Home"),
+    ("💡", "Bills"),
+    ("🎬", "Movies"),
+    ("🎮", "Gaming"),
+    ("📚", "Learning"),
+    ("💊", "Health"),
+    ("✈️", "Travel"),
+    ("🎁", "Treat"),
+    ("🐾", "Pets"),
+    ("🎵", "Music"),
+    ("🧾", "Essentials"),
+    ("🌱", "Savings"),
+]
+VALID_EXPENSE_STICKERS = {sticker for sticker, _ in EXPENSE_STICKERS}
+
 
 # ==============================
 # DATABASE
@@ -68,6 +88,7 @@ def init_db():
                 category_id INTEGER NOT NULL,
                 date TEXT,
                 note TEXT DEFAULT '',
+                sticker TEXT NOT NULL DEFAULT '',
                 user_id INTEGER,
                 FOREIGN KEY (category_id) REFERENCES categories(id)
             )
@@ -99,6 +120,8 @@ def init_db():
         cat_cols = columns("categories")
         exp_cols, bud_cols = columns("expenses"), columns("budgets")
 
+        if "sticker" not in exp_cols:
+            conn.execute("ALTER TABLE expenses ADD COLUMN sticker TEXT NOT NULL DEFAULT ''")
         if "user_id" not in cat_cols:
             conn.execute("ALTER TABLE categories ADD COLUMN user_id INTEGER")
             conn.execute("""
@@ -438,13 +461,14 @@ def insert_expense(conn, expense):
     cursor = conn.execute(
         f"""
         INSERT INTO expenses (
-            amount, category_id, {', '.join(date_columns)}, note, user_id
+            amount, category_id, {', '.join(date_columns)}, note, sticker, user_id
         )
-        VALUES (?, ?, {date_placeholders}, ?, ?)
+        VALUES (?, ?, {date_placeholders}, ?, ?, ?)
         """,
         (
             expense["amount"], expense["category_id"],
             *[expense["date"] for _ in date_columns], expense["note"],
+            expense.get("sticker", ""),
             current_user_id(),
         ),
     )
@@ -460,12 +484,13 @@ def update_expense(conn, expense, expense_id):
     conn.execute(
         f"""
         UPDATE expenses
-        SET amount = ?, category_id = ?, {date_assignments}, note = ?
+        SET amount = ?, category_id = ?, {date_assignments}, note = ?, sticker = ?
         WHERE id = ? AND user_id = ?
         """,
         (
             expense["amount"], expense["category_id"],
-            *[expense["date"] for _ in date_columns], expense["note"], expense_id,
+            *[expense["date"] for _ in date_columns], expense["note"],
+            expense.get("sticker", ""), expense_id,
             current_user_id(),
         ),
     )
@@ -476,6 +501,7 @@ def validate_expense_form():
     category_text = request.form.get("category_id", "").strip()
     expense_date = request.form.get("date", "").strip()
     note = request.form.get("note", "").strip()
+    sticker = request.form.get("sticker", "").strip()
 
     try:
         amount = float(amount_text)
@@ -498,6 +524,9 @@ def validate_expense_form():
     if category is None:
         return None, "The selected category does not exist."
 
+    if sticker and sticker not in VALID_EXPENSE_STICKERS:
+        return None, "Please select a valid sticker."
+
     try:
         parsed_date = datetime.strptime(expense_date, "%Y-%m-%d").date()
         if parsed_date.isoformat() != expense_date:
@@ -510,6 +539,7 @@ def validate_expense_form():
         "category_id": category_id,
         "date": parsed_date.isoformat(),
         "note": note,
+        "sticker": sticker,
     }, None
 
 
@@ -662,7 +692,11 @@ def add_expense():
         flash("Expense added successfully!", "success")
         return redirect(url_for("index"))
 
-    return render_template("add_expense.html", categories=get_categories())
+    return render_template(
+        "add_expense.html",
+        categories=get_categories(),
+        expense_stickers=EXPENSE_STICKERS,
+    )
 
 
 # ==============================
@@ -695,7 +729,10 @@ def edit_expense(expense_id):
         return redirect(url_for("index"))
 
     return render_template(
-        "edit_expense.html", expense=expense, categories=get_categories()
+        "edit_expense.html",
+        expense=expense,
+        categories=get_categories(),
+        expense_stickers=EXPENSE_STICKERS,
     )
 
 
@@ -949,7 +986,7 @@ def api_valid_month(value):
 def api_expense_payload(payload, current=None):
     if not payload:
         return None, api_error("Provide at least one expense field.", 400)
-    allowed = {"amount", "category_id", "date", "note"}
+    allowed = {"amount", "category_id", "date", "note", "sticker"}
     unknown = set(payload) - allowed
     if unknown:
         return None, api_error(
@@ -974,11 +1011,17 @@ def api_expense_payload(payload, current=None):
     note = values.get("note", "")
     if not isinstance(note, str):
         return None, api_error("Note must be a string.", 400, "note")
+    sticker = values.get("sticker", "")
+    if not isinstance(sticker, str) or (
+        sticker and sticker not in VALID_EXPENSE_STICKERS
+    ):
+        return None, api_error("Sticker is not available.", 400, "sticker")
     return {
         "amount": float(values["amount"]),
         "category_id": category_id,
         "date": values["date"],
         "note": note.strip(),
+        "sticker": sticker,
     }, None
 
 
@@ -990,6 +1033,7 @@ def api_expense_row(row):
         "category": row["category_name"],
         "date": row["date"],
         "note": row["note"] or "",
+        "sticker": row["sticker"] or "",
     }
 
 
@@ -1170,6 +1214,7 @@ def api_expense(expense_id):
             "category_id": row["category_id"],
             "date": row["date"],
             "note": row["note"] or "",
+            "sticker": row["sticker"] or "",
         }
         values, error = api_expense_payload(
             payload, current if request.method == "PATCH" else None

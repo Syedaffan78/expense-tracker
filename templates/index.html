@@ -193,6 +193,7 @@
                 <tr>
                     <th>Date</th>
                     <th>Category</th>
+                    <th>Sticker</th>
                     <th>Amount</th>
                     <th>Note</th>
                     <th>Actions</th>
@@ -207,6 +208,19 @@
 
                     <td>{{ expense.expense_date }}</td>
                     <td>{{ expense.category }}</td>
+                    <td>
+                        {% if expense.sticker %}
+                            <span
+                                class="expense-sticker"
+                                role="img"
+                                aria-label="Expense sticker: {{ expense.sticker }}"
+                            >
+                                {{ expense.sticker }}
+                            </span>
+                        {% else %}
+                            <span class="muted">—</span>
+                        {% endif %}
+                    </td>
                     <td>{{ expense.amount | money }}</td>
                     <td>{{ expense.note }}</td>
 
@@ -234,7 +248,7 @@
                 {% else %}
 
                 <tr>
-                    <td colspan="5">No expenses found.</td>
+                    <td colspan="6">No expenses found.</td>
                 </tr>
 
                 {% endfor %}
