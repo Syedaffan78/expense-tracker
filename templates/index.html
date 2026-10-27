@@ -1,0 +1,403 @@
+
+{% extends "base.html" %}
+
+{% block title %}Dashboard | Expense Tracker{% endblock %}
+
+{% block content %}
+
+<h2>Financial Dashboard</h2>
+
+<!-- EXPENSE STATISTICS -->
+<section class="stats">
+
+    <div class="card">
+        <p>Total Spending</p>
+        <h2>{{ total | money }}</h2>
+    </div>
+
+    <div class="card">
+        <p>Today's Spending</p>
+        <h2>{{ today_total | money }}</h2>
+    </div>
+
+    <div class="card">
+        <p>This Month's Spending</p>
+        <h2>{{ month_total | money }}</h2>
+    </div>
+
+    <div class="card">
+        <p>Highest Expense</p>
+        <h2>{{ highest | money }}</h2>
+    </div>
+
+</section>
+
+
+<!-- MONTHLY BUDGET -->
+{% if monthly_budget %}
+
+<div class="card">
+
+    <h3>Monthly Budget</h3>
+
+    <p>Budget: {{ monthly_budget | money }}</p>
+    <p>Spent: {{ month_total | money }}</p>
+    <p>Remaining: {{ budget_remaining | money }}</p>
+
+    <progress value="{{ budget_percent }}" max="100"></progress>
+
+    <p>{{ "%.1f"|format(budget_percent) }}% of budget used</p>
+
+    {% if month_total > monthly_budget %}
+        <div class="alert error">
+            Warning! You have exceeded your monthly budget.
+        </div>
+    {% endif %}
+
+</div>
+
+{% endif %}
+
+
+<!-- CHART DATA -->
+<div
+    id="chart-data"
+    data-categories='{{ category_totals | map(attribute="name") | list | tojson }}'
+    data-category-values='{{ category_totals | map(attribute="total") | list | tojson }}'
+    data-months='{{ monthly | map(attribute="month") | list | tojson }}'
+    data-month-values='{{ monthly | map(attribute="total") | list | tojson }}'
+    hidden>
+</div>
+
+
+<!-- CHARTS -->
+<div class="grid">
+
+    <div class="card">
+        <h3>Category-wise Spending</h3>
+        <canvas id="categoryChart"></canvas>
+    </div>
+
+    <div class="card">
+        <h3>Monthly Spending Trend</h3>
+        <canvas id="monthlyChart"></canvas>
+    </div>
+
+</div>
+
+
+<!-- CATEGORY BUDGETS -->
+<div class="card">
+
+    <h3>Category Budgets</h3>
+
+    {% for budget in category_budgets %}
+
+        <div class="budget-item">
+
+            <strong>{{ budget.category }}</strong>
+
+            <p>
+                Spent: {{ budget.spent | money }}
+                / Budget: {{ budget.amount | money }}
+            </p>
+
+            {% if budget.spent > budget.amount %}
+                <div class="alert error">
+                    This category is over budget!
+                </div>
+            {% endif %}
+
+        </div>
+
+    {% else %}
+
+        <p>No category-specific budgets configured for this month.</p>
+
+    {% endfor %}
+
+</div>
+
+
+<!-- SEARCH AND FILTER -->
+<div class="card">
+
+    <h3>Search and Filter Expenses</h3>
+
+    <form method="GET" class="filters">
+
+        <input
+            type="text"
+            name="search"
+            placeholder="Search notes or categories"
+            value="{{ filters.search }}"
+        >
+
+        <select name="category_id">
+
+            <option value="">All Categories</option>
+
+            {% for category in categories %}
+
+                <option
+                    value="{{ category.id }}"
+                    {% if filters.category_id|string == category.id|string %}
+                        selected
+                    {% endif %}
+                >
+                    {{ category.name }}
+                </option>
+
+            {% endfor %}
+
+        </select>
+
+        <label for="start_date">From:</label>
+
+        <input
+            type="date"
+            id="start_date"
+            name="start_date"
+            value="{{ filters.start_date }}"
+        >
+
+        <label for="end_date">To:</label>
+
+        <input
+            type="date"
+            id="end_date"
+            name="end_date"
+            value="{{ filters.end_date }}"
+        >
+
+        <button type="submit">Apply Filters</button>
+
+        <a href="{{ url_for('index') }}">Clear Filters</a>
+
+    </form>
+
+</div>
+
+
+<!-- EXPENSE TABLE -->
+<div class="card">
+
+    <h3>All Expenses</h3>
+
+    <div class="expense-scroll-shell">
+    <div class="table-wrap expense-scroll">
+
+        <table>
+
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Category</th>
+                    <th>Amount</th>
+                    <th>Note</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+
+            <tbody>
+
+                {% for expense in expenses %}
+
+                <tr>
+
+                    <td>{{ expense.expense_date }}</td>
+                    <td>{{ expense.category }}</td>
+                    <td>{{ expense.amount | money }}</td>
+                    <td>{{ expense.note }}</td>
+
+                    <td>
+
+                        <a href="{{ url_for('edit_expense', expense_id=expense.id) }}">
+                            Edit
+                        </a>
+
+                        <form
+                            method="POST"
+                            action="{{ url_for('delete_expense', expense_id=expense.id) }}"
+                            class="preserve-scroll-on-submit"
+                            onsubmit="return confirm('Delete this expense?')"
+                        >
+                            <button type="submit" class="danger">
+                                Delete
+                            </button>
+                        </form>
+
+                    </td>
+
+                </tr>
+
+                {% else %}
+
+                <tr>
+                    <td colspan="5">No expenses found.</td>
+                </tr>
+
+                {% endfor %}
+
+            </tbody>
+
+        </table>
+
+    </div>
+    <div class="expense-scroll-blur" aria-hidden="true"></div>
+    </div>
+
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const scrollArea = document.querySelector(".expense-scroll");
+    const shell = document.querySelector(".expense-scroll-shell");
+
+    if (!scrollArea || !shell) return;
+
+    function updateExpenseBlur() {
+        shell.classList.toggle(
+            "has-more-expenses",
+            scrollArea.scrollHeight > scrollArea.clientHeight + 1
+                && scrollArea.scrollTop + scrollArea.clientHeight
+                    < scrollArea.scrollHeight - 1
+        );
+    }
+
+    scrollArea.addEventListener("scroll", updateExpenseBlur);
+    window.addEventListener("resize", updateExpenseBlur);
+    updateExpenseBlur();
+});
+</script>
+
+
+<!-- DELETE ALL EXPENSES -->
+<div class="card">
+
+    <h3>Delete All Expenses</h3>
+
+    <p>This permanently deletes all expense records.</p>
+
+    <form
+        method="POST"
+        action="{{ url_for('delete_all') }}"
+        class="preserve-scroll-on-submit"
+        onsubmit="return confirm('Are you sure you want to delete all expenses?')"
+    >
+
+        <input type="hidden" name="confirmation" value="DELETE">
+
+        <button type="submit" class="danger">
+            Delete All Expenses
+        </button>
+
+    </form>
+
+</div>
+
+
+<!-- CHART JAVASCRIPT -->
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+
+    const element = document.getElementById("chart-data");
+
+    if (!element || typeof Chart === "undefined") {
+        console.error("Chart data or Chart.js is unavailable.");
+        return;
+    }
+
+    Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+    Chart.defaults.color = "#777573";
+
+    // Read chart data supplied by Flask.
+    const categoryLabels = JSON.parse(element.dataset.categories);
+    const categoryValues = JSON.parse(element.dataset.categoryValues);
+
+    const monthLabels = JSON.parse(element.dataset.months);
+    const monthValues = JSON.parse(element.dataset.monthValues);
+
+
+    // Category-wise doughnut chart.
+    const categoryCanvas = document.getElementById("categoryChart");
+
+    if (categoryCanvas) {
+        new Chart(categoryCanvas, {
+            type: "doughnut",
+
+            data: {
+                labels: categoryLabels,
+
+                datasets: [{
+                    label: "Expenses",
+                    data: categoryValues,
+                    backgroundColor: [
+                        "#ff692d",
+                        "#22201d",
+                        "#777573",
+                        "#dcd9d6",
+                        "#cccccc",
+                        "#efecea",
+                        "#aaa6a2",
+                        "#8d8985"
+                    ],
+                    borderColor: "#ffffff",
+                    borderWidth: 3
+                }]
+            },
+
+            options: {
+                responsive: true
+            }
+        });
+    }
+
+
+    // Monthly spending line chart.
+    const monthlyCanvas = document.getElementById("monthlyChart");
+
+    if (monthlyCanvas) {
+        new Chart(monthlyCanvas, {
+            type: "line",
+
+            data: {
+                labels: monthLabels,
+
+                datasets: [{
+                    label: "Monthly Expenses (₹)",
+                    data: monthValues,
+                    tension: 0.3,
+                    borderColor: "#ff692d",
+                    backgroundColor: "rgba(255, 105, 45, 0.12)",
+                    pointBackgroundColor: "#ff692d",
+                    pointBorderColor: "#ffffff",
+                    pointBorderWidth: 2,
+                    fill: true
+                }]
+            },
+
+            options: {
+                responsive: true,
+
+                scales: {
+                    x: {
+                        grid: {
+                            color: "#efecea"
+                        }
+                    },
+                    y: {
+                        beginAtZero: true,
+                        grid: {
+                            color: "#dcd9d6"
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+});
+</script>
+
+{% endblock %}

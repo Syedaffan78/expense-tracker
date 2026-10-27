@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>{% block title %}Expense Tracker{% endblock %}</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css', v='monarch') }}">
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+
+<header class="site-header">
+    <div class="site-navigation">
+        <a class="brand" href="{{ url_for('index') }}">Expense Tracker</a>
+        <nav aria-label="Main navigation">
+            <a href="{{ url_for('index') }}"
+               {% if request.endpoint == "index" %}aria-current="page"{% endif %}>
+                Dashboard
+            </a>
+            <a class="nav-action" href="{{ url_for('add_expense') }}"
+               {% if request.endpoint == "add_expense" %}aria-current="page"{% endif %}>
+                Add Expense
+            </a>
+            <a href="{{ url_for('categories') }}"
+               {% if request.endpoint in ("categories", "delete_category") %}aria-current="page"{% endif %}>
+                Categories
+            </a>
+            <a href="{{ url_for('budgets') }}"
+               {% if request.endpoint in ("budgets", "delete_budget") %}aria-current="page"{% endif %}>
+                Budgets
+            </a>
+            <a href="{{ url_for('export_expenses') }}">Export CSV</a>
+        </nav>
+    </div>
+</header>
+
+<main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+</main>
+
+<script>
+document.addEventListener("submit", function (event) {
+    if (event.target.matches(".preserve-scroll-on-submit")) {
+        sessionStorage.setItem(
+            "expense-tracker:scroll-position",
+            `${window.scrollX},${window.scrollY}`
+        );
+    }
+});
+
+document.addEventListener("DOMContentLoaded", function () {
+    const savedPosition = sessionStorage.getItem(
+        "expense-tracker:scroll-position"
+    );
+    if (!savedPosition) return;
+
+    sessionStorage.removeItem("expense-tracker:scroll-position");
+    const [x, y] = savedPosition.split(",").map(Number);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+    requestAnimationFrame(function () {
+        window.scrollTo(x, y);
+    });
+});
+</script>
+
+</body>
+</html>

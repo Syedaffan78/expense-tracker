@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+
+{% block title %}Manage Budgets{% endblock %}
+
+{% block content %}
+
+<h2>Manage Budgets</h2>
+
+<div class="card">
+    <p>
+        Leave the category blank to set an overall monthly budget.
+        Choose a category to set a budget for that category.
+    </p>
+</div>
+
+<form method="POST" class="card form">
+
+    <label for="month">Month</label>
+
+    <input
+        id="month"
+        type="month"
+        name="month"
+        value="{{ current_month }}"
+        required
+    >
+
+    <label for="category_id">Category</label>
+
+    <select id="category_id" name="category_id">
+
+        <option value="">Overall Monthly Budget</option>
+
+        {% for category in categories %}
+            <option value="{{ category.id }}">
+                {{ category.name }}
+            </option>
+        {% endfor %}
+
+    </select>
+
+    <label for="amount">Budget Amount (₹)</label>
+
+    <input
+        id="amount"
+        type="number"
+        name="amount"
+        min="0.01"
+        max="999999999"
+        step="0.01"
+        placeholder="Example: 10000"
+        required
+    >
+
+    <button type="submit">Save Budget</button>
+
+</form>
+
+<div class="card">
+
+    <h3>Saved Budgets</h3>
+
+    {% for budget in budgets %}
+
+        <div class="row">
+
+            <span>
+                {{ budget.month }} —
+                {{ budget.category or "Overall Budget" }}:
+                {{ budget.amount | money }}
+            </span>
+
+            <form
+                method="POST"
+                action="{{ url_for('delete_budget', budget_id=budget.id) }}"
+                onsubmit="return confirm('Delete this budget?')"
+            >
+                <button type="submit" class="danger">
+                    Delete
+                </button>
+            </form>
+
+        </div>
+
+    {% else %}
+
+        <p>No budgets created yet.</p>
+
+    {% endfor %}
+
+</div>
+
+{% endblock %}

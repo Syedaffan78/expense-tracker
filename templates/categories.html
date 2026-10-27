@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Manage Categories{% endblock %}
+
+{% block content %}
+
+<h2>Manage Categories</h2>
+
+<form method="POST" class="card form">
+
+    <label for="name">Category Name</label>
+
+    <input
+        id="name"
+        type="text"
+        name="name"
+        maxlength="50"
+        placeholder="Example: Gym"
+        required
+    >
+
+    <button type="submit">Add Category</button>
+
+</form>
+
+<div class="card">
+
+    <h3>Your Categories</h3>
+
+    {% for category in categories %}
+
+        <div class="row">
+
+            <span>
+                {{ category.name }}
+                — {{ category.expense_count }} expenses
+            </span>
+
+            {% if category.expense_count == 0 %}
+
+                <form
+                    method="POST"
+                    action="{{ url_for('delete_category', category_id=category.id) }}"
+                    onsubmit="return confirm('Delete this category?')"
+                >
+                    <button type="submit" class="danger">
+                        Delete
+                    </button>
+                </form>
+
+            {% endif %}
+
+        </div>
+
+    {% else %}
+
+        <p>No categories available.</p>
+
+    {% endfor %}
+
+</div>
+
+{% endblock %}
